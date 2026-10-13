@@ -1906,9 +1906,19 @@ void Overview::renderStrip() const {
             // the same band buildStrip reserved above every card (both layouts).
             const double labelBand = stripLabelH();
             const double lx        = card.cx() - lw / 2.0;
-            const double ly        = card.y - labelBand + (labelBand - lh) / 2.0;
-            const float  la        = it.active ? static_cast<float>(e) : static_cast<float>(e) * 0.75F;
-            g_pHyprOpenGL->renderTexture(it.label, pxb(CBox(lx, ly, lw, lh), s), {.a = la});
+            double       ly        = card.y - labelBand + (labelBand - lh) / 2.0;
+            const double pa = it.active ? e : e * 0.25; // inactive pills recede...
+            const double ta = it.active ? e : e * 0.75; // ...but their text stays readable
+            const double padX = 10.0, padY = 2.0;
+            const double pw = lw + 2 * padX, ph = lh + 2 * padY;
+            // Keep a visible gap between the pill and the card: a pill bottom
+            // touching card.y reads as intersected by the card border. Shift the
+            // text+pill up as one (text stays centered in the pill) so the pill
+            // bottom always clears the card top.
+            if (ly + lh + padY > card.y - 6.0)
+                ly = card.y - 6.0 - padY - lh;
+            g_pHyprOpenGL->renderRect(pxb(CBox(lx - padX, ly - padY, pw, ph), s), argb(0xcc11151c, pa), {.round = pxr(ph / 2.0, s)});
+            g_pHyprOpenGL->renderTexture(it.label, pxb(CBox(lx, ly, lw, lh), s), {.a = static_cast<float>(ta)});
         }
     }
 }
