@@ -1915,10 +1915,10 @@ void Overview::renderStrip() const {
             const double labelBand = stripLabelH();
             const double lx        = card.cx() - lw / 2.0;
             double       ly        = card.y - labelBand + (labelBand - lh) / 2.0;
-            const double pa = it.active ? e : e * 0.25; // inactive pills recede...
-            const double ta = it.active ? e : e * 0.75; // ...but their text stays readable
+            const double pa   = it.active ? e : e * 0.25; // inactive pills recede...
+            const double ta   = it.active ? e : e * 0.75; // ...but their text stays readable
             const double padX = 10.0, padY = 2.0;
-            const double pw = lw + 2 * padX, ph = lh + 2 * padY;
+            const double pw   = lw + 2 * padX, ph = lh + 2 * padY;
             // Keep a visible gap between the pill and the card: a pill bottom
             // touching card.y reads as intersected by the card border. Shift the
             // text+pill up as one (text stays centered in the pill) so the pill
