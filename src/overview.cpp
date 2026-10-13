@@ -1884,7 +1884,15 @@ void Overview::renderStrip() const {
                 // a cropped edge must stay square — rounding it would leave the corner arc
                 // floating in the middle of the card, where nothing covers it.
                 const bool cropped = !roughly(vis.w, wb.w, 0.01) || !roughly(vis.h, wb.h, 0.01);
-                g_pHyprOpenGL->renderRect(pxb(vis, s), argb(0xff14181f, e), {.round = cropped ? 0 : pxr(4, s)});
+                // Same radius as the live surface above it (see renderStripWindows):
+                // the backing used to be a hardcoded r=4 while the surface rounds up
+                // to strip_card_round, so the backing's squarer corners poked out past
+                // the surface's rounder ones as thin dark edges. Invisible on the active
+                // card (its ring covers the corners), but with no border on inactive
+                // cards there was nothing hiding them.
+                const double winRound =
+                    cropped ? 0.0 : std::min(static_cast<double>(cardRound), std::min(sw.rel.w * card.w, sw.rel.h * card.h) * 0.35);
+                g_pHyprOpenGL->renderRect(pxb(vis, s), argb(0xff14181f, e), {.round = pxr(winRound, s)});
             }
         }
 
