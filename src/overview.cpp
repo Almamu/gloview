@@ -102,6 +102,16 @@ int pxr(double round, double s) {
     return static_cast<int>(round * s);
 }
 
+// renderText() rasterizes at a fixed point size with no monitor-scale awareness, so a
+// texture baked at N pt holds N-pt worth of pixels. Drawing it scaled up to N*s pixels
+// (via pxb) stretches it → blurry text on any monitor with scale != 1. Bake at
+// N*scale pt instead and draw at (texturePixels / scale) logical px, so the drawn box
+// maps 1:1 back onto the texture texels. Same technique as Hyprland's own groupbar
+// titles (CHyprGroupBarDecoration: PTITLEFONTSIZE * monitorScale).
+int labelPt(int ptLogical, double scale) {
+    return std::max(1, static_cast<int>(std::round(ptLogical * std::max(1.0, scale))));
+}
+
 // Hollow ring drawn INSIDE `boxPx` and ON TOP of the live surface, so the band overlaps (crops)
 // the window's own edge — like a real Hyprland border, not an outline hugging the tile. A grown
 // renderRect can't do this: it's filled, so on top it hides the window and underneath its arc is
@@ -1058,7 +1068,8 @@ void Overview::buildTiles() {
     // cache each window's title texture, drawn under the tile on hover.
     if (g_pHyprOpenGL && g_pHyprRenderer) {
         g_pHyprOpenGL->makeEGLCurrent();
-        const auto lblCol = CHyprColor(1.0, 1.0, 1.0, 0.96);
+        const auto   lblCol = CHyprColor(1.0, 1.0, 1.0, 0.96);
+        const double scale  = m ? m->m_scale : 1.0;
         // show_window_labels = 0: skip the texture entirely rather than skipping the draw, so
         // a hidden label costs no renderText per window per rebuild.
         for (auto& t : m_tiles) {
@@ -1070,11 +1081,15 @@ void Overview::buildTiles() {
                 text = w->m_class;
             if (text.size() > 80)
                 text = text.substr(0, 79) + "…";
-            t.label = g_pHyprRenderer->renderText(text, lblCol, 15, false, "", 0, 700);
+            t.label = g_pHyprRenderer->renderText(text, lblCol, labelPt(15, scale), false, "", 0, 700);
         }
-        // pre-render the desktop-mode "✕" glyph once (rendering text mid-pass is unsafe)
-        if (!m_closeGlyph)
-            m_closeGlyph = g_pHyprRenderer->renderText("✕", CHyprColor(1.0, 1.0, 1.0, 1.0), 16, false, "", 0, 800);
+        // pre-render the desktop-mode "✕" glyph once (rendering text mid-pass is unsafe).
+        // Re-bake when the monitor scale changed (multi-monitor / scale switch), else the
+        // cached glyph draws stretched on the new scale.
+        if (!m_closeGlyph || m_closeGlyphScale != scale) {
+            m_closeGlyph      = g_pHyprRenderer->renderText("✕", CHyprColor(1.0, 1.0, 1.0, 1.0), labelPt(16, scale), false, "", 0, 800);
+            m_closeGlyphScale = scale;
+        }
     }
 }
 
@@ -1176,22 +1191,24 @@ void Overview::buildStrip() {
     if (!haveEmptyTail)
         m_strip.push_back(std::move(plus));
 
-    // render workspace name labels (cached textures) up front
+    // render workspace name labels (cached textures) up front, baked at the monitor
+    // scale (see labelPt) so they stay crisp on HiDPI.
     if (g_pHyprOpenGL && g_pHyprRenderer && showWorkspaceLabels()) {
         g_pHyprOpenGL->makeEGLCurrent();
-        const auto lblCol = CHyprColor(1.0, 1.0, 1.0, 0.92);
+        const auto   lblCol = CHyprColor(1.0, 1.0, 1.0, 0.92);
+        const double scale  = m ? m->m_scale : 1.0;
         for (auto& it : m_strip) {
             if (it.isPlus && !it.isNew)
                 continue;
             if (it.isAll) {
-                it.label = g_pHyprRenderer->renderText("All workspaces", lblCol, 13, false, "", 0, 600);
+                it.label = g_pHyprRenderer->renderText("All workspaces", lblCol, labelPt(13, scale), false, "", 0, 600);
                 continue;
             }
             const auto ws = it.ws.lock();
             std::string nm = ws ? ws->m_name : std::to_string(it.id);
             const bool numeric = !nm.empty() && std::all_of(nm.begin(), nm.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)); });
             const std::string text = numeric ? ("Workspace " + nm) : nm;
-            it.label               = g_pHyprRenderer->renderText(text, lblCol, 13, false, "", 0, 600);
+            it.label               = g_pHyprRenderer->renderText(text, lblCol, labelPt(13, scale), false, "", 0, 600);
         }
     }
 
@@ -1871,15 +1888,20 @@ void Overview::renderStrip() const {
             }
         }
 
-        // workspace label, centered above the card
+        // workspace label, centered above the card in a dark pill like the window
+        // titles (same hardcoded 0xcc11151c fill, no config). The texture is baked
+        // at pt*scale pixels (see labelPt), so divide back to logical px: pxb() then
+        // maps 1:1 onto texels instead of stretching a scale-1 raster. Padding is
+        // tighter than the window pill (14/6) and the block shifts up so the pill
+        // bottom always clears the card top with a gap (see below).
         if (showWorkspaceLabels() && it.label && it.label->m_size.x > 0) {
-            double       lw    = it.label->m_size.x;
-            double       lh    = it.label->m_size.y;
+            double       lw    = it.label->m_size.x / s;
+            double       lh    = it.label->m_size.y / s;
             const double maxLw = card.w + 24.0;
             if (lw > maxLw) {
-                const double s = maxLw / lw;
-                lw *= s;
-                lh *= s;
+                const double down = maxLw / lw;
+                lw *= down;
+                lh *= down;
             }
             // the same band buildStrip reserved above every card (both layouts).
             const double labelBand = stripLabelH();
@@ -2038,21 +2060,24 @@ void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift) const {
     g_pHyprOpenGL->renderRect(pxb(bb, s), argb(cfgColor("plugin:gloview:preview_bg", 0xff14181f), t.fades ? e : 1.0), {.round = pxr(round, s)});
 
     // desktop (canvas) mode: a "✕" close button in the top-right of every preview.
+    // The glyph is baked at pt*scale (see labelPt): work in logical px so the fit
+    // computation and pxb() map 1:1 back onto texels.
     if (m_desktopMode && !lift) {
         const LRect br = closeButtonRect(lb);
         g_pHyprOpenGL->renderRect(pxb(br, s), argb(cfgColor("plugin:gloview:close_button_color", 0xe6e23b3b), e), {.round = pxr(br.h / 2.0, s)});
         if (m_closeGlyph && m_closeGlyph->m_size.x > 0) {
-            const double gw = m_closeGlyph->m_size.x, gh = m_closeGlyph->m_size.y;
+            const double gw = m_closeGlyph->m_size.x / s, gh = m_closeGlyph->m_size.y / s;
             const double gs = std::min((br.w * 0.62) / std::max(1.0, gw), (br.h * 0.62) / std::max(1.0, gh));
             const double dw = gw * gs, dh = gh * gs;
             g_pHyprOpenGL->renderTexture(m_closeGlyph, pxb(CBox(br.x + (br.w - dw) / 2.0, br.y + (br.h - dh) / 2.0, dw, dh), s), {.a = static_cast<float>(e)});
         }
     }
 
-    // window title in a dark pill below the tile (on hover or keyboard selection)
+    // window title in a dark pill below the tile (on hover or keyboard selection).
+    // Same scale-bake as the strip labels: divide back to logical px for a 1:1 draw.
     if ((framed || selected) && !lift && t.label && t.label->m_size.x > 0) {
-        const double lw   = t.label->m_size.x;
-        const double lh   = t.label->m_size.y;
+        const double lw   = t.label->m_size.x / s;
+        const double lh   = t.label->m_size.y / s;
         const double padX = 14.0, padY = 6.0;
         const double pw   = lw + 2 * padX;
         const double ph   = lh + 2 * padY;
@@ -2199,7 +2224,7 @@ void Overview::renderPrevPreviews() const {
             continue;
         const LRect lb{t.target.x + off.x, t.target.y + off.y, t.target.w, t.target.h};
         g_pHyprOpenGL->renderRoundedShadow(pxb(LRect{lb.x, lb.y + 6.0, lb.w, lb.h}, s), pxr(round, s), 2.F, static_cast<int>(16.0 * s), shadowCol, e * 0.9);
-        // same 1px inset as drawPreviewTile: keeps the backing under the over-covered surface
+        // same 1px inset as drawPreviewTile: keeps the backing under the over-covered surface.
         const LRect bb{lb.x + 1.0, lb.y + 1.0, std::max(0.0, lb.w - 2.0), std::max(0.0, lb.h - 2.0)};
         g_pHyprOpenGL->renderRect(pxb(bb, s), bg, {.round = pxr(round, s)});
     }

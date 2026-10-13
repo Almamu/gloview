@@ -239,6 +239,7 @@ class Overview {
     // preview never floats/moves the real window — that stays put.
     std::unordered_map<void*, LRect>      m_canvasPos;
     mutable SP<Render::ITexture>          m_closeGlyph;       // cached "✕" for the desktop-mode close buttons
+    mutable double                          m_closeGlyphScale = 0.0;  // monitor scale the glyph was baked at (labels are scale-baked, see labelPt)
 
     // "+" add-workspace pop-in: the freshly created card scales up from its center.
     int                                   m_newCardId    = 0; // workspace id of the animating card (0 = none)
