@@ -105,11 +105,13 @@ int pxr(double round, double s) {
 // renderText() rasterizes at a fixed point size with no monitor-scale awareness, so a
 // texture baked at N pt holds N-pt worth of pixels. Drawing it scaled up to N*s pixels
 // (via pxb) stretches it → blurry text on any monitor with scale != 1. Bake at
-// N*scale pt instead and draw at (texturePixels / scale) logical px, so the drawn box
-// maps 1:1 back onto the texture texels. Same technique as Hyprland's own groupbar
-// titles (CHyprGroupBarDecoration: PTITLEFONTSIZE * monitorScale).
+// N*scale pt instead and draw at (texturePixels / bakeScale) logical px (labelSize), so the
+// drawn box maps 1:1 back onto the texture texels. Same technique as Hyprland's own groupbar
+// titles (CHyprGroupBarDecoration: PTITLEFONTSIZE * monitorScale). Deliberately NOT clamped
+// to scale >= 1: the draw divides by the same scale, so a clamp drew every label oversized on
+// a monitor below scale 1.
 int labelPt(int ptLogical, double scale) {
-    return std::max(1, static_cast<int>(std::round(ptLogical * std::max(1.0, scale))));
+    return std::max(1, static_cast<int>(std::round(ptLogical * scale)));
 }
 
 // Hollow ring drawn INSIDE `boxPx` and ON TOP of the live surface, so the band overlaps (crops)
@@ -386,6 +388,41 @@ CHyprColor argb(Hyprlang::INT raw, double alphaMul = 1.0) {
     return CHyprColor(r, g, b, a * std::clamp(alphaMul, 0.0, 1.0));
 }
 
+// Logical size of a label baked by labelPt at `bakeScale`. Divide by the scale the texture was
+// BAKED at, not the live m_scale: the two differ if the monitor scale changes while the
+// overview is up, and dividing by the live one draws every label at oldScale/newScale size.
+Vector2D labelSize(const SP<Render::ITexture>& tex, double bakeScale) {
+    return tex->m_size / std::max(bakeScale, 0.01);
+}
+
+// Dark pill (hardcoded 0xcc11151c, no config) with a scale-baked label centered in it; `pill`
+// is logical. Shared by the strip workspace labels and the window titles. The text box is
+// SNAPPED to whole pixels: renderTexture samples linearly, so a fractional origin (card
+// centering, slide offset, fractional scale) blends neighbouring texels and the text goes soft
+// again despite the 1:1 bake.
+void drawLabelPill(const SP<Render::ITexture>& tex, const Vector2D& textSz, const LRect& pill, double pillA, double textA, double s) {
+    g_pHyprOpenGL->renderRect(pxb(pill, s), argb(0xcc11151c, pillA), {.round = pxr(pill.h / 2.0, s)});
+    const CBox textPx{std::round((pill.cx() - textSz.x / 2.0) * s), std::round((pill.cy() - textSz.y / 2.0) * s), std::round(textSz.x * s), std::round(textSz.y * s)};
+    g_pHyprOpenGL->renderTexture(tex, textPx, {.a = static_cast<float>(textA)});
+}
+
+// Strip workspace-label pill: text padding, and the gap between the pill bottom and the card
+// top (a pill touching card.y reads as cut by the card's border). stripLabelH sizes the band
+// above every card from these, so the pill always fits in the space buildStrip reserved.
+constexpr double STRIP_PILL_PAD_X = 10.0;
+constexpr double STRIP_PILL_PAD_Y = 2.0;
+constexpr double STRIP_PILL_GAP   = 6.0;
+
+// Corner radius of a window preview inside a strip card. ONE formula for its opaque backing
+// (renderStrip) and its live surface (renderStripWindows): the backing used to be a hardcoded
+// r=4 under a surface rounded up to strip_card_round, so its squarer corners poked out past the
+// surface's as thin dark edges on borderless (inactive) cards, where no ring covers them. A
+// slot cropped by the card stays square — a rounded corner there would float mid-card with
+// nothing behind it.
+double stripWindowRound(double cardRound, double slotW, double slotH, bool cropped) {
+    return cropped ? 0.0 : std::min(cardRound, std::min(slotW, slotH) * 0.35);
+}
+
 // Immediate-mode overlay chrome split into phases so the LIVE window surfaces (queued
 // CSurfacePassElements, not immediate GL) layer between the chrome:
 // backdrop+backings (Back) → main surfaces → preview rings (MainFront) → strip chrome (Mid) →
@@ -612,9 +649,18 @@ bool Overview::showWindowLabels() const {
 }
 
 // Band reserved above every card for its name. With workspace labels off it collapses to 0
-// so the cards grow into the freed space instead of leaving a gap where the text was.
+// so the cards grow into the freed space instead of leaving a gap where the text was. Sized
+// from the baked labels (buildStrip bakes them before laying out the cards) so the pill plus
+// its gap to the card always fits: a fixed band let the pill poke out over the previous card
+// (vertical strip, small strip_gap) or get clipped at the monitor edge (small strip_margin).
 double Overview::stripLabelH() const {
-    return showWorkspaceLabels() ? 26.0 : 0.0;
+    if (!showWorkspaceLabels())
+        return 0.0;
+    double lh = 0.0;
+    for (const auto& it : m_strip)
+        if (it.label && it.label->m_size.y > 0)
+            lh = std::max(lh, labelSize(it.label, it.labelScale).y);
+    return lh > 0.0 ? lh + 2 * STRIP_PILL_PAD_Y + STRIP_PILL_GAP : 26.0;
 }
 
 // gnome / hyprnome-style workspaces: only populated workspaces are listed, and the strip
@@ -1069,7 +1115,10 @@ void Overview::buildTiles() {
     if (g_pHyprOpenGL && g_pHyprRenderer) {
         g_pHyprOpenGL->makeEGLCurrent();
         const auto   lblCol = CHyprColor(1.0, 1.0, 1.0, 0.96);
-        const double scale  = m ? m->m_scale : 1.0;
+        const double scale  = m->m_scale;
+        // Ellipsize a title wider than the monitor (minus drawPreviewTile's pill padding and
+        // edge inset) at bake time rather than letting its pill run off-screen.
+        const int maxTitlePx = std::max(1, static_cast<int>((m->m_size.x - 2 * (14.0 + 6.0)) * scale));
         // show_window_labels = 0: skip the texture entirely rather than skipping the draw, so
         // a hidden label costs no renderText per window per rebuild.
         for (auto& t : m_tiles) {
@@ -1081,7 +1130,12 @@ void Overview::buildTiles() {
                 text = w->m_class;
             if (text.size() > 80)
                 text = text.substr(0, 79) + "…";
+            // Re-bake with maxWidth only when it overflows: a set Pango width right-aligns RTL
+            // text inside it (auto-dir), so every Arabic/Hebrew title would get a monitor-wide pill.
             t.label = g_pHyprRenderer->renderText(text, lblCol, labelPt(15, scale), false, "", 0, 700);
+            if (t.label && t.label->m_size.x > maxTitlePx)
+                t.label = g_pHyprRenderer->renderText(text, lblCol, labelPt(15, scale), false, "", maxTitlePx, 700);
+            t.labelScale = scale;
         }
         // pre-render the desktop-mode "✕" glyph once (rendering text mid-pass is unsafe).
         // Re-bake when the monitor scale changed (multi-monitor / scale switch), else the
@@ -1193,22 +1247,25 @@ void Overview::buildStrip() {
 
     // render workspace name labels (cached textures) up front, baked at the monitor
     // scale (see labelPt) so they stay crisp on HiDPI.
-    if (g_pHyprOpenGL && g_pHyprRenderer && showWorkspaceLabels()) {
-        g_pHyprOpenGL->makeEGLCurrent();
-        const auto   lblCol = CHyprColor(1.0, 1.0, 1.0, 0.92);
-        const double scale  = m ? m->m_scale : 1.0;
-        for (auto& it : m_strip) {
-            if (it.isPlus && !it.isNew)
-                continue;
-            if (it.isAll) {
-                it.label = g_pHyprRenderer->renderText("All workspaces", lblCol, labelPt(13, scale), false, "", 0, 600);
-                continue;
-            }
+    const bool   bakeLabels = g_pHyprOpenGL && g_pHyprRenderer && showWorkspaceLabels();
+    const double scale      = m->m_scale;
+    const auto   bakeLabel  = [scale](StripItem& it, int maxWidthPx) {
+        std::string text = "All workspaces";
+        if (!it.isAll) {
             const auto ws = it.ws.lock();
             std::string nm = ws ? ws->m_name : std::to_string(it.id);
             const bool numeric = !nm.empty() && std::all_of(nm.begin(), nm.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)); });
-            const std::string text = numeric ? ("Workspace " + nm) : nm;
-            it.label               = g_pHyprRenderer->renderText(text, lblCol, labelPt(13, scale), false, "", 0, 600);
+            text = numeric ? ("Workspace " + nm) : nm;
+        }
+        it.label      = g_pHyprRenderer->renderText(text, CHyprColor(1.0, 1.0, 1.0, 0.92), labelPt(13, scale), false, "", maxWidthPx, 600);
+        it.labelScale = scale;
+    };
+    if (bakeLabels) {
+        g_pHyprOpenGL->makeEGLCurrent();
+        for (auto& it : m_strip) {
+            if (it.isPlus && !it.isNew)
+                continue;
+            bakeLabel(it, 0);
         }
     }
 
@@ -1257,6 +1314,18 @@ void Overview::buildStrip() {
         else
             it.card = LRect{cardX, main + labelH, cardW, cardH};
         main += cellMain + gap;
+    }
+
+    // Re-bake, ellipsized, any label whose pill would be wider than its card: cards sit only
+    // strip_gap apart, so a wider pill covers the neighbouring card's label. Needs the laid-out
+    // card width, hence after layout; ellipsizing keeps the line height labelH was sized from.
+    // Only overflowing labels get a maxWidth (see buildTiles: it right-aligns RTL text).
+    if (bakeLabels) {
+        for (auto& it : m_strip) {
+            const double maxTextW = it.card.w - 2 * STRIP_PILL_PAD_X;
+            if (it.label && labelSize(it.label, it.labelScale).x > maxTextW)
+                bakeLabel(it, std::max(1, static_cast<int>(maxTextW * scale)));
+        }
     }
 
     // On open / rebuild, scroll the active workspace into view (centered) when the
@@ -1883,50 +1952,22 @@ void Overview::renderStrip() const {
                     continue;
                 // a cropped edge must stay square — rounding it would leave the corner arc
                 // floating in the middle of the card, where nothing covers it.
-                const bool cropped = !roughly(vis.w, wb.w, 0.01) || !roughly(vis.h, wb.h, 0.01);
-                // Same radius as the live surface above it (see renderStripWindows):
-                // the backing used to be a hardcoded r=4 while the surface rounds up
-                // to strip_card_round, so the backing's squarer corners poked out past
-                // the surface's rounder ones as thin dark edges. Invisible on the active
-                // card (its ring covers the corners), but with no border on inactive
-                // cards there was nothing hiding them.
-                const double winRound =
-                    cropped ? 0.0 : std::min(static_cast<double>(cardRound), std::min(sw.rel.w * card.w, sw.rel.h * card.h) * 0.35);
-                g_pHyprOpenGL->renderRect(pxb(vis, s), argb(0xff14181f, e), {.round = pxr(winRound, s)});
+                const bool   cropped  = !roughly(vis.w, wb.w, 0.01) || !roughly(vis.h, wb.h, 0.01);
+                const double winRound = stripWindowRound(cardRound, std::max(2.0, sw.rel.w * card.w), std::max(2.0, sw.rel.h * card.h), cropped);
+                // the surface rounds with the window's own roundingPower; a default-2 arc here
+                // pokes out past a flatter one (decoration:rounding_power < 2).
+                g_pHyprOpenGL->renderRect(pxb(vis, s), argb(0xff14181f, e), {.round = pxr(winRound, s), .roundingPower = w->roundingPower()});
             }
         }
 
-        // workspace label, centered above the card in a dark pill like the window
-        // titles (same hardcoded 0xcc11151c fill, no config). The texture is baked
-        // at pt*scale pixels (see labelPt), so divide back to logical px: pxb() then
-        // maps 1:1 onto texels instead of stretching a scale-1 raster. Padding is
-        // tighter than the window pill (14/6) and the block shifts up so the pill
-        // bottom always clears the card top with a gap (see below).
+        // workspace label in a dark pill above the card, its bottom STRIP_PILL_GAP clear of the
+        // card top, inside the band stripLabelH reserved. buildStrip ellipsized the text so the
+        // pill is never wider than the card. Inactive pills recede, but their text stays
+        // readable; the "All" card counts as active when it is lit (actLike), like its fill.
         if (showWorkspaceLabels() && it.label && it.label->m_size.x > 0) {
-            double       lw    = it.label->m_size.x / s;
-            double       lh    = it.label->m_size.y / s;
-            const double maxLw = card.w + 24.0;
-            if (lw > maxLw) {
-                const double down = maxLw / lw;
-                lw *= down;
-                lh *= down;
-            }
-            // the same band buildStrip reserved above every card (both layouts).
-            const double labelBand = stripLabelH();
-            const double lx        = card.cx() - lw / 2.0;
-            double       ly        = card.y - labelBand + (labelBand - lh) / 2.0;
-            const double pa   = it.active ? e : e * 0.25; // inactive pills recede...
-            const double ta   = it.active ? e : e * 0.75; // ...but their text stays readable
-            const double padX = 10.0, padY = 2.0;
-            const double pw   = lw + 2 * padX, ph = lh + 2 * padY;
-            // Keep a visible gap between the pill and the card: a pill bottom
-            // touching card.y reads as intersected by the card border. Shift the
-            // text+pill up as one (text stays centered in the pill) so the pill
-            // bottom always clears the card top.
-            if (ly + lh + padY > card.y - 6.0)
-                ly = card.y - 6.0 - padY - lh;
-            g_pHyprOpenGL->renderRect(pxb(CBox(lx - padX, ly - padY, pw, ph), s), argb(0xcc11151c, pa), {.round = pxr(ph / 2.0, s)});
-            g_pHyprOpenGL->renderTexture(it.label, pxb(CBox(lx, ly, lw, lh), s), {.a = static_cast<float>(ta)});
+            const Vector2D sz = labelSize(it.label, it.labelScale);
+            const double   pw = sz.x + 2 * STRIP_PILL_PAD_X, ph = sz.y + 2 * STRIP_PILL_PAD_Y;
+            drawLabelPill(it.label, sz, LRect{card.cx() - pw / 2.0, card.y - STRIP_PILL_GAP - ph, pw, ph}, actLike ? e : e * 0.25, actLike ? e : e * 0.75, s);
         }
     }
 }
@@ -1974,9 +2015,7 @@ void Overview::renderStripWindows() const {
             // Round the surface only while it is fully inside the card — on a cropped edge the
             // corner arc would sit mid-card with nothing behind it.
             const bool   cropped    = !roughly(clipPx.w, slotPx.w, 0.01) || !roughly(clipPx.h, slotPx.h, 0.01);
-            const double stripRound = cropped ? 0.0 :
-                                                std::min(static_cast<double>(cfgInt("plugin:gloview:strip_card_round", 10)),
-                                                         std::min(slot.w, slot.h) * 0.35);
+            const double stripRound = stripWindowRound(cfgInt("plugin:gloview:strip_card_round", 10), slot.w, slot.h, cropped);
             renderWindowLive(w, m, slotPx, clipPx, static_cast<float>(e), when, m_previewFilterGrid, stripRound);
         }
     }
@@ -2084,7 +2123,8 @@ void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift) const {
         const LRect br = closeButtonRect(lb);
         g_pHyprOpenGL->renderRect(pxb(br, s), argb(cfgColor("plugin:gloview:close_button_color", 0xe6e23b3b), e), {.round = pxr(br.h / 2.0, s)});
         if (m_closeGlyph && m_closeGlyph->m_size.x > 0) {
-            const double gw = m_closeGlyph->m_size.x / s, gh = m_closeGlyph->m_size.y / s;
+            const Vector2D gsz = labelSize(m_closeGlyph, m_closeGlyphScale);
+            const double   gw = gsz.x, gh = gsz.y;
             const double gs = std::min((br.w * 0.62) / std::max(1.0, gw), (br.h * 0.62) / std::max(1.0, gh));
             const double dw = gw * gs, dh = gh * gs;
             g_pHyprOpenGL->renderTexture(m_closeGlyph, pxb(CBox(br.x + (br.w - dw) / 2.0, br.y + (br.h - dh) / 2.0, dw, dh), s), {.a = static_cast<float>(e)});
@@ -2092,17 +2132,17 @@ void Overview::drawPreviewTile(size_t i, const LRect& slot, bool lift) const {
     }
 
     // window title in a dark pill below the tile (on hover or keyboard selection).
-    // Same scale-bake as the strip labels: divide back to logical px for a 1:1 draw.
     if ((framed || selected) && !lift && t.label && t.label->m_size.x > 0) {
-        const double lw   = t.label->m_size.x / s;
-        const double lh   = t.label->m_size.y / s;
-        const double padX = 14.0, padY = 6.0;
-        const double pw   = lw + 2 * padX;
-        const double ph   = lh + 2 * padY;
-        const double px   = std::clamp(lb.cx() - pw / 2.0, 6.0, m->m_size.x - pw - 6.0);
-        const double py   = std::min(lb.y + lb.h + 10.0, m->m_size.y - ph - 6.0);
-        g_pHyprOpenGL->renderRect(pxb(CBox(px, py, pw, ph), s), argb(0xcc11151c, e), {.round = pxr(ph / 2.0, s)});
-        g_pHyprOpenGL->renderTexture(t.label, pxb(CBox(px + padX, py + padY, lw, lh), s), {.a = static_cast<float>(e)});
+        const Vector2D sz   = labelSize(t.label, t.labelScale);
+        const double   padX = 14.0, padY = 6.0;
+        const double   pw   = sz.x + 2 * padX;
+        const double   ph   = sz.y + 2 * padY;
+        // max/min, not std::clamp: a pill wider than the monitor (buildTiles ellipsizes to fit,
+        // but a mode/scale change before the rebuild can still overshoot) makes hi < lo, which
+        // is UB and aborts under _GLIBCXX_ASSERTIONS (Arch's default makepkg flags).
+        const double px = std::max(6.0, std::min(lb.cx() - pw / 2.0, m->m_size.x - pw - 6.0));
+        const double py = std::min(lb.y + lb.h + 10.0, m->m_size.y - ph - 6.0);
+        drawLabelPill(t.label, sz, LRect{px, py, pw, ph}, e, e, s);
     }
 }
 
@@ -2242,7 +2282,7 @@ void Overview::renderPrevPreviews() const {
             continue;
         const LRect lb{t.target.x + off.x, t.target.y + off.y, t.target.w, t.target.h};
         g_pHyprOpenGL->renderRoundedShadow(pxb(LRect{lb.x, lb.y + 6.0, lb.w, lb.h}, s), pxr(round, s), 2.F, static_cast<int>(16.0 * s), shadowCol, e * 0.9);
-        // same 1px inset as drawPreviewTile: keeps the backing under the over-covered surface.
+        // same 1px inset as drawPreviewTile: keeps the backing under the over-covered surface
         const LRect bb{lb.x + 1.0, lb.y + 1.0, std::max(0.0, lb.w - 2.0), std::max(0.0, lb.h - 2.0)};
         g_pHyprOpenGL->renderRect(pxb(bb, s), bg, {.round = pxr(round, s)});
     }
