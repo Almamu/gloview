@@ -538,7 +538,14 @@ bool Overview::initialize() {
         if (onMouseAxis(event))
             info.cancelled = true;
     });
-    m_mouseMoveL = events.input.mouse.move.listen([this](const Vector2D&, Event::SCallbackInfo&) { onMouseMove(); });
+    m_mouseMoveL = events.input.mouse.move.listen([this](const Vector2D&, Event::SCallbackInfo& info) {
+        onMouseMove();
+        // Modal pointer: while the overview is up, windows behind it get no motion
+        // (no hover effects, no focus-follows-mouse). The cursor itself has already
+        // moved by the time this fires; the overview reads its position directly.
+        if (m_active)
+            info.cancelled = true;
+    });
     m_keyL       = events.input.keyboard.key.listen([this](const IKeyboard::SKeyEvent& event, Event::SCallbackInfo& info) {
         bool cancel = false;
         onKey(event, cancel);
