@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -63,11 +64,12 @@ class Overview {
     explicit Overview(HANDLE handle);
     ~Overview();
 
-    bool initialize();
+    bool initialize(); // the FIRST instance only: installs the global hooks + event listeners that route to every instance
 
     void toggle();
-    void open();
-    void close();
+    void open(PHLMONITOR target = nullptr); // nullptr = the monitor under the cursor
+    void close(); // closes the whole group: every other open instance follows (see closeGroup)
+    void closeSelf();
     void hardClose(); // immediate, animation-free teardown for the UNLOAD path (hyprctl gloviewunload)
     void toggleDesktop(); // open (or, if already open, switch into) free-arrange desktop mode
     void toggleAllWorkspaces(); // open (or, if already open, toggle) the all-workspaces "expo" main view
@@ -105,6 +107,9 @@ class Overview {
     void onMouseMove();
     void updateHover(); // recompute hovered tile/card from current cursor pos
     void onKey(const IKeyboard::SKeyEvent& e, bool& cancel);
+    bool onSwipeBegin(const IPointer::SSwipeBeginEvent& e);   // true = the swipe is ours (cancel it)
+    bool onSwipeUpdate(const IPointer::SSwipeUpdateEvent& e);
+    bool onSwipeEnd(const IPointer::SSwipeEndEvent& e);
     bool shouldHideWindow(const PHLWINDOW& w, const PHLMONITOR& m) const;
     // true while capturing the given window's snapshot: forces Hyprland to render
     // it even though it sits on an inactive workspace (otherwise the snapshot is
@@ -114,6 +119,23 @@ class Overview {
     [[nodiscard]] bool       active() const { return m_active; }
     [[nodiscard]] PHLMONITOR monitor() const { return m_monitor.lock(); }
     [[nodiscard]] bool       blurEnabled() const; // plugin:gloview:blur != 0 (queried by the pass)
+
+    // ---- multi-monitor group ----
+    // One Overview per monitor (g_overviews). With plugin:gloview:all_monitors set, opening
+    // opens every monitor at once; closing any instance (Esc, a click, picking a window, a
+    // swipe down) closes them all. Input goes to the instance under the cursor; a button
+    // release goes to the instance that took the press. With all_monitors = 0 only the
+    // cursor's monitor opens, as before.
+    static Overview* forMonitor(const PHLMONITOR& m); // that monitor's instance, created on first use
+    static Overview* pointerOwner();                  // open instance under the cursor, else the first open one
+    static Overview* commandTarget();                 // next/prev/setworkspace: pointerOwner(), else the first instance
+    static bool      anyOpen();                       // some instance is up and not closing
+    static void      openGroup(int allOverride = -1);  // allOverride: m_allOverride for the opened instances
+    static void      closeGroup();
+    static void      toggleGroup();
+    static void      toggleAllWorkspacesGroup();
+    static void      toggleDesktopGroup();
+    static void      hardCloseGroup();
 
   private:
     struct Tile {
@@ -265,10 +287,10 @@ class Overview {
     CHyprSignalListener m_mouseAxisL;
     CHyprSignalListener m_mouseMoveL;
     CHyprSignalListener m_keyL;
-    // touchpad swipe handling while open (see the swipe listeners in initialize())
-    CHyprSignalListener      m_swipeBeginL;
-    CHyprSignalListener      m_swipeUpdateL;
-    CHyprSignalListener      m_swipeEndL;
+    CHyprSignalListener m_swipeBeginL;
+    CHyprSignalListener m_swipeUpdateL;
+    CHyprSignalListener m_swipeEndL;
+    // touchpad swipe handling while open (see onSwipeBegin)
     bool                     m_swipeOwned   = false; // this swipe began while open: ours to the end
     bool                     m_swipeStepped = false; // it already switched a workspace (one per swipe)
     double                   m_swipeX = 0.0, m_swipeY = 0.0;
@@ -370,4 +392,7 @@ class Overview {
 
 } // namespace gloview
 
-inline gloview::Overview* g_overview = nullptr;
+// Every instance, one per monitor that has opened (see the multi-monitor group in Overview).
+// The first is the one that holds the hooks and listeners (g_overview).
+inline std::vector<std::unique_ptr<gloview::Overview>> g_overviews;
+inline gloview::Overview*                             g_overview = nullptr;

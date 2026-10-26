@@ -17,7 +17,6 @@ extern "C" {
 #include "overview.hpp"
 
 inline HANDLE                         g_handle = nullptr;
-inline std::unique_ptr<gloview::Overview> g_overviewOwned;
 
 namespace {
 // Keep the SP so cfg* can read the resolved value() — see ConfigRegistry in overview.hpp.
@@ -44,37 +43,37 @@ void addStr(const char* name, Config::STRING fallback) {
 
 SDispatchResult dispToggle(std::string) {
     if (g_overview)
-        g_overview->toggle();
+        gloview::Overview::toggleGroup();
     return {.success = true};
 }
 SDispatchResult dispOpen(std::string) {
     if (g_overview)
-        g_overview->open();
+        gloview::Overview::openGroup();
     return {.success = true};
 }
 SDispatchResult dispClose(std::string) {
     if (g_overview)
-        g_overview->close();
+        gloview::Overview::closeGroup();
     return {.success = true};
 }
 SDispatchResult dispDesktop(std::string) {
     if (g_overview)
-        g_overview->toggleDesktop();
+        gloview::Overview::toggleDesktopGroup();
     return {.success = true};
 }
 SDispatchResult dispAllWorkspaces(std::string) {
     if (g_overview)
-        g_overview->toggleAllWorkspaces();
+        gloview::Overview::toggleAllWorkspacesGroup();
     return {.success = true};
 }
 SDispatchResult dispNext(std::string) {
     if (g_overview)
-        g_overview->nextWorkspace();
+        gloview::Overview::commandTarget()->nextWorkspace();
     return {.success = true};
 }
 SDispatchResult dispPrev(std::string) {
     if (g_overview)
-        g_overview->prevWorkspace();
+        gloview::Overview::commandTarget()->prevWorkspace();
     return {.success = true};
 }
 // gloview:setworkspace <id> — show that workspace in the overview; switch the live desktop to
@@ -84,7 +83,7 @@ SDispatchResult dispSetWorkspace(std::string arg) {
         return {.success = true};
     try {
         const int id = std::stoi(arg);
-        if (!g_overview->setWorkspace(id))
+        if (!gloview::Overview::commandTarget()->setWorkspace(id))
             return {.success = false, .error = "gloview: no workspace " + arg + " on this monitor"};
     } catch (const std::exception&) { // stoi throws on empty / non-numeric
         return {.success = false, .error = "gloview:setworkspace expects a workspace id"};
@@ -94,42 +93,42 @@ SDispatchResult dispSetWorkspace(std::string arg) {
 
 int luaToggle(lua_State*) {
     if (g_overview)
-        g_overview->toggle();
+        gloview::Overview::toggleGroup();
     return 0;
 }
 int luaOpen(lua_State*) {
     if (g_overview)
-        g_overview->open();
+        gloview::Overview::openGroup();
     return 0;
 }
 int luaClose(lua_State*) {
     if (g_overview)
-        g_overview->close();
+        gloview::Overview::closeGroup();
     return 0;
 }
 int luaDesktop(lua_State*) {
     if (g_overview)
-        g_overview->toggleDesktop();
+        gloview::Overview::toggleDesktopGroup();
     return 0;
 }
 int luaAllWorkspaces(lua_State*) {
     if (g_overview)
-        g_overview->toggleAllWorkspaces();
+        gloview::Overview::toggleAllWorkspacesGroup();
     return 0;
 }
 int luaNext(lua_State*) {
     if (g_overview)
-        g_overview->nextWorkspace();
+        gloview::Overview::commandTarget()->nextWorkspace();
     return 0;
 }
 int luaPrev(lua_State*) {
     if (g_overview)
-        g_overview->prevWorkspace();
+        gloview::Overview::commandTarget()->prevWorkspace();
     return 0;
 }
 // hl.plugin.gloview.setworkspace(2) — returns true when the workspace was found.
 int luaSetWorkspace(lua_State* L) {
-    const bool ok = g_overview && g_overview->setWorkspace(static_cast<int>(luaL_checkinteger(L, 1)));
+    const bool ok = g_overview && gloview::Overview::commandTarget()->setWorkspace(static_cast<int>(luaL_checkinteger(L, 1)));
     lua_pushboolean(L, ok ? 1 : 0);
     return 1;
 }
@@ -188,6 +187,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addInt("plugin:gloview:focus_follows_mouse", Config::INTEGER{1});      // keyboard selection tracks the hovered tile
     addInt("plugin:gloview:scroll_switches_workspace", Config::INTEGER{1});// wheel over the main area steps prev/next workspace
     addInt("plugin:gloview:passthrough_keys", Config::INTEGER{1});         // unhandled keys reach Hyprland (keybinds keep working)
+    addInt("plugin:gloview:all_monitors", Config::INTEGER{0});            // open on every monitor at once (closing one closes all)
     addInt("plugin:gloview:swipe_enabled", Config::INTEGER{1});            // touchpad swipes while open step workspaces / close
     addInt("plugin:gloview:swipe_fingers", Config::INTEGER{3});            // finger count of those swipes
     addInt("plugin:gloview:swipe_distance", Config::INTEGER{200});         // sideways travel that steps one workspace
@@ -243,12 +243,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addInt("plugin:gloview:hide_overlay_layers", Config::INTEGER{0}); // fade out Overlay layer surfaces (popups/notifications)
     addStr("plugin:gloview:above_namespaces", "");                    // comma/space list of layer namespaces to draw ABOVE the overview (supports trailing '*' glob); namespaces containing "aboveoverview" are always treated this way
 
-    g_overviewOwned = std::make_unique<gloview::Overview>(handle);
-    g_overview      = g_overviewOwned.get();
+    g_overviews.push_back(std::make_unique<gloview::Overview>(handle));
+    g_overview = g_overviews.front().get();
     if (!g_overview->initialize()) {
         HyprlandAPI::addNotification(handle, "[gloview] initialization failed", CHyprColor(1.0, 0.2, 0.2, 1.0), 6000);
         g_overview = nullptr;
-        g_overviewOwned.reset();
+        g_overviews.clear();
         // Throw so Hyprland ejects the plugin (it catches this and runs unloadPlugin).
         // Returning normally instead kept a half-alive instance loaded — dispatchers and
         // config registered but no render hooks — which then blocked every later load
@@ -275,7 +275,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                     .exact = true,
                                                     .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
                                                         if (g_overview)
-                                                            g_overview->toggle();
+                                                            gloview::Overview::toggleGroup();
                                                         return "ok\n";
                                                     },
                                                 });
@@ -288,7 +288,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                     .exact = true,
                                                     .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
                                                         if (g_overview)
-                                                            g_overview->close();
+                                                            gloview::Overview::closeGroup();
                                                         return "ok\n";
                                                     },
                                                 });
@@ -303,7 +303,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                     .exact = true,
                                                     .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
                                                         if (g_overview)
-                                                            g_overview->hardClose();
+                                                            gloview::Overview::hardCloseGroup();
                                                         return "ok\n";
                                                     },
                                                 });
@@ -314,7 +314,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                     .exact = true,
                                                     .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
                                                         if (g_overview)
-                                                            g_overview->toggleDesktop();
+                                                            gloview::Overview::toggleDesktopGroup();
                                                         return "ok\n";
                                                     },
                                                 });
@@ -325,7 +325,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                     .exact = true,
                                                     .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
                                                         if (g_overview)
-                                                            g_overview->toggleAllWorkspaces();
+                                                            gloview::Overview::toggleAllWorkspacesGroup();
                                                         return "ok\n";
                                                     },
                                                 });
@@ -337,7 +337,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                     .exact = true,
                                                     .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
                                                         if (g_overview)
-                                                            g_overview->nextWorkspace();
+                                                            gloview::Overview::commandTarget()->nextWorkspace();
                                                         return "ok\n";
                                                     },
                                                 });
@@ -346,7 +346,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                                     .exact = true,
                                                     .fn    = [](eHyprCtlOutputFormat, std::string) -> std::string {
                                                         if (g_overview)
-                                                            g_overview->prevWorkspace();
+                                                            gloview::Overview::commandTarget()->prevWorkspace();
                                                         return "ok\n";
                                                     },
                                                 });
@@ -377,5 +377,5 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
 APICALL EXPORT void PLUGIN_EXIT() {
     g_overview = nullptr;
-    g_overviewOwned.reset();
+    g_overviews.clear();
 }

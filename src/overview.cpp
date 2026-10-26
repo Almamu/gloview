@@ -363,20 +363,26 @@ PSHOULDRENDER       g_shouldRenderOrig       = nullptr;
 PSHOULDRENDERWINDOW g_shouldRenderWindowOrig = nullptr;
 
 bool hkShouldRenderWindow(void* thisptr, PHLWINDOW window, PHLMONITOR monitor) {
+    // Every instance (one per monitor) gets a say: a window is force-rendered if any of them
+    // is snapshotting it, and hidden if any of them previews it.
     if (g_overview) {
         // force-render the snapshotting window (may be on an inactive workspace, which
         // Hyprland's original rejects → blank/grey preview).
-        if (g_overview->forceRenderWindow(window))
-            return true;
-        if (g_overview->shouldHideWindow(window, monitor))
-            return false;
+        for (const auto& o : g_overviews)
+            if (o->forceRenderWindow(window))
+                return true;
+        for (const auto& o : g_overviews)
+            if (o->shouldHideWindow(window, monitor))
+                return false;
     }
     return g_shouldRenderOrig ? g_shouldRenderOrig(thisptr, window, monitor) : true;
 }
 
 bool hkShouldRenderWindowAny(void* thisptr, PHLWINDOW window) {
-    if (g_overview && g_overview->forceRenderWindow(window))
-        return true;
+    if (g_overview)
+        for (const auto& o : g_overviews)
+            if (o->forceRenderWindow(window))
+                return true;
     return g_shouldRenderWindowOrig ? g_shouldRenderWindowOrig(thisptr, window) : true;
 }
 
@@ -513,6 +519,10 @@ Overview::~Overview() {
         g_pEventLoopManager->removeTimer(m_recaptureTimer);
         m_recaptureTimer.reset();
     }
+    // Only the first instance holds the hooks; the others must not reset the originals the
+    // hooks still call.
+    if (!m_shouldRenderHook && !m_shouldRenderWindowHook)
+        return;
     if (m_shouldRenderHook) {
         HyprlandAPI::removeFunctionHook(m_handle, m_shouldRenderHook);
         m_shouldRenderHook = nullptr;
@@ -528,67 +538,76 @@ Overview::~Overview() {
 bool Overview::initialize() {
     auto& events = Event::bus()->m_events;
 
-    m_renderStageL = events.render.stage.listen([this](eRenderStage stage) { renderStage(stage); });
-    m_mouseButtonL = events.input.mouse.button.listen([this](const IPointer::SButtonEvent& event, Event::SCallbackInfo& info) {
+    // One set of listeners for every instance (one per monitor), routed here. Rendering is
+    // per monitor already (each instance only draws on its own); pointer, keyboard and
+    // touchpad input goes to the instance under the cursor (pointerOwner()), and a button
+    // release to the instance that took the press, so a drag that leaves its monitor still
+    // ends where it started.
+    m_renderStageL = events.render.stage.listen([](eRenderStage stage) {
+        // A snapshot's nested render pass re-emits render stages; no instance may add its
+        // overlay into it (see the m_capturing guard in renderStage).
+        for (const auto& o : g_overviews)
+            if (o->m_capturing)
+                return;
+        for (size_t i = 0; i < g_overviews.size(); ++i)
+            g_overviews[i]->renderStage(stage);
+    });
+    m_mouseButtonL = events.input.mouse.button.listen([](const IPointer::SButtonEvent& event, Event::SCallbackInfo& info) {
         const auto copied = event;
-        if (onMouseButton(copied))
+        Overview*  target = nullptr;
+        if (copied.state != WL_POINTER_BUTTON_STATE_PRESSED)
+            for (const auto& o : g_overviews)
+                if (o->m_active && o->m_pressTile != -1) // -1 = PRESS_NONE (defined with the handler)
+                    target = o.get();
+        if (!target)
+            target = pointerOwner();
+        if (target && target->onMouseButton(copied))
             info.cancelled = true;
     });
-    m_mouseAxisL = events.input.mouse.axis.listen([this](const IPointer::SAxisEvent& event, Event::SCallbackInfo& info) {
-        if (onMouseAxis(event))
+    m_mouseAxisL = events.input.mouse.axis.listen([](const IPointer::SAxisEvent& event, Event::SCallbackInfo& info) {
+        if (const auto target = pointerOwner(); target && target->onMouseAxis(event))
             info.cancelled = true;
     });
-    m_mouseMoveL = events.input.mouse.move.listen([this](const Vector2D&, Event::SCallbackInfo& info) {
-        onMouseMove();
+    m_mouseMoveL = events.input.mouse.move.listen([](const Vector2D&, Event::SCallbackInfo& info) {
+        // Every instance: hover leaves one monitor's tiles as it enters the other's, and each
+        // redraws its own copy of the cursor.
+        bool anyActive = false;
+        for (size_t i = 0; i < g_overviews.size(); ++i) {
+            g_overviews[i]->onMouseMove();
+            anyActive = anyActive || g_overviews[i]->m_active;
+        }
         // Modal pointer: while the overview is up, windows behind it get no motion
         // (no hover effects, no focus-follows-mouse). The cursor itself has already
         // moved by the time this fires; the overview reads its position directly.
-        if (m_active)
+        if (anyActive)
             info.cancelled = true;
     });
-    m_keyL       = events.input.keyboard.key.listen([this](const IKeyboard::SKeyEvent& event, Event::SCallbackInfo& info) {
+    m_keyL = events.input.keyboard.key.listen([](const IKeyboard::SKeyEvent& event, Event::SCallbackInfo& info) {
+        const auto target = pointerOwner();
+        if (!target)
+            return;
         bool cancel = false;
-        onKey(event, cancel);
+        target->onKey(event, cancel);
         if (cancel)
             info.cancelled = true;
     });
-    // Touchpad swipes (swipe_fingers, default 3) while the overview is up belong to it:
-    // sideways steps the displayed workspace, one per swipe (fingers left = next, like
-    // Hyprland's workspace swipe with its default workspace_swipe_invert), down closes it.
-    // Without this, Hyprland's own workspace swipe gesture switches the live workspace
-    // behind the overview. The swipe is claimed at begin, when its direction is not known
-    // yet, so Hyprland's gestures never see half of one. Closed, swipes pass through.
-    m_swipeBeginL = events.gesture.swipe.begin.listen([this](const IPointer::SSwipeBeginEvent& e, Event::SCallbackInfo& info) {
-        m_swipeOwned = m_active && cfgInt("plugin:gloview:swipe_enabled", 1) != 0 &&
-            static_cast<int>(e.fingers) == cfgInt("plugin:gloview:swipe_fingers", 3);
-        if (!m_swipeOwned)
-            return;
-        m_swipeX = m_swipeY = 0.0;
-        m_swipeStepped      = false;
-        info.cancelled      = true;
+    // Touchpad swipes: claimed at begin by the instance under the cursor (see onSwipeBegin);
+    // update and end go to whichever instance owns the swipe.
+    m_swipeBeginL = events.gesture.swipe.begin.listen([](const IPointer::SSwipeBeginEvent& e, Event::SCallbackInfo& info) {
+        for (const auto& o : g_overviews)
+            o->m_swipeOwned = false;
+        if (const auto target = pointerOwner(); target && target->onSwipeBegin(e))
+            info.cancelled = true;
     });
-    m_swipeUpdateL = events.gesture.swipe.update.listen([this](const IPointer::SSwipeUpdateEvent& e, Event::SCallbackInfo& info) {
-        if (!m_swipeOwned)
-            return;
-        info.cancelled = true;
-        m_swipeX += e.delta.x;
-        m_swipeY += e.delta.y;
-        // One workspace per swipe, however long (like macOS). Without swipe_wrap, a swipe
-        // past either end of the strip does nothing.
-        const double step = std::max(1, cfgInt("plugin:gloview:swipe_distance", 200));
-        if (m_active && !m_swipeStepped && std::abs(m_swipeX) >= step && std::abs(m_swipeX) > std::abs(m_swipeY)) {
-            stepWorkspace(m_swipeX < 0 ? 1 : -1, cfgInt("plugin:gloview:swipe_wrap", 0) != 0);
-            m_swipeStepped = true;
-        }
+    m_swipeUpdateL = events.gesture.swipe.update.listen([](const IPointer::SSwipeUpdateEvent& e, Event::SCallbackInfo& info) {
+        for (size_t i = 0; i < g_overviews.size(); ++i)
+            if (g_overviews[i]->onSwipeUpdate(e))
+                info.cancelled = true;
     });
-    m_swipeEndL = events.gesture.swipe.end.listen([this](const IPointer::SSwipeEndEvent& e, Event::SCallbackInfo& info) {
-        if (!m_swipeOwned)
-            return;
-        info.cancelled = true;
-        m_swipeOwned   = false;
-        const int closeDist = cfgInt("plugin:gloview:swipe_close_distance", 150); // 0 = never
-        if (closeDist > 0 && m_active && !e.cancelled && !m_swipeStepped && m_swipeY >= closeDist && m_swipeY > std::abs(m_swipeX))
-            close();
+    m_swipeEndL = events.gesture.swipe.end.listen([](const IPointer::SSwipeEndEvent& e, Event::SCallbackInfo& info) {
+        for (size_t i = 0; i < g_overviews.size(); ++i)
+            if (g_overviews[i]->onSwipeEnd(e))
+                info.cancelled = true;
     });
 
     const auto matches = HyprlandAPI::findFunctionsByName(m_handle, "shouldRenderWindow");
@@ -917,11 +936,11 @@ void Overview::setDesktopMode(bool on) {
     replayReflow(oldBoxes); // rebuild + glide previews grid<->canvas, chrome pinned at 1
 }
 
-void Overview::open() {
+void Overview::open(PHLMONITOR target) {
     if (m_active && m_opening)
         return;
 
-    const auto m = State::monitorState()->query().vec(Pointer::mgr()->position()).run();
+    const auto m = target ? target : State::monitorState()->query().vec(Pointer::mgr()->position()).run();
     if (!m || !m->m_activeWorkspace)
         return;
 
@@ -971,7 +990,11 @@ void Overview::open() {
     }
 
     // seed keyboard selection on the focused window (else first tile) for arrow-nav/Enter.
-    m_selected = m_tiles.empty() ? -1 : 0;
+    // Opened alongside the focused monitor's instance (all_monitors), no ring until the
+    // pointer or the arrows get here: the focused window is on the other monitor.
+    const auto focusMon = Desktop::focusState()->monitor();
+    const bool otherMon = cfgInt("plugin:gloview:all_monitors", 0) != 0 && focusMon && focusMon != m;
+    m_selected          = (m_tiles.empty() || otherMon) ? -1 : 0;
     if (const auto fw = Desktop::focusState()->window()) {
         for (size_t i = 0; i < m_tiles.size(); ++i)
             if (m_tiles[i].win.lock() == fw) {
@@ -991,6 +1014,13 @@ void Overview::open() {
 }
 
 void Overview::close() {
+    // Closing one monitor's overview closes the others: they open together (all_monitors),
+    // and Esc, picking a window or a swipe down on either dismisses both.
+    closeSelf();
+    closeGroup();
+}
+
+void Overview::closeSelf() {
     if (!m_active)
         return;
     // Every tile's box as it is ON SCREEN right now, taken before the state flips below (the
@@ -2676,7 +2706,7 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
             if (lx >= c.x && ly >= c.y && lx <= c.x + c.w && ly <= c.y + c.h) {
                 m_pressTile = PRESS_STRIP;
                 if (m_strip[i].isAll)
-                    toggleAllWorkspaces();
+                    toggleAllWorkspacesGroup(); // every open monitor flips together
                 else if (m_strip[i].isPlus)
                     addWorkspace(m_strip[i].id); // 0 for the plain "+"; the advertised id for the dynamic tail
                 else
@@ -3181,7 +3211,7 @@ void Overview::onKey(const IKeyboard::SKeyEvent& e, bool& cancel) {
     else if (keyMatches(k, mods, "plugin:gloview:key_desktop", "shift"))
         setDesktopMode(!m_desktopMode);
     else if (keyMatches(k, mods, "plugin:gloview:key_all_workspaces", "a"))
-        toggleAllWorkspaces(); // flip the expo (all-workspaces) main view
+        toggleAllWorkspacesGroup(); // flip the expo (all-workspaces) main view, on every open monitor
     else if (const int ws = keyIndex(k, mods, "plugin:gloview:key_workspace", "1,2,3,4,5,6,7,8,9,0"); ws >= 0) {
         // number-row 1..0 → switch to the Nth (non-"+") card's workspace, in the overview
         // AND for real now. Update m_liveWsAtOpen so the exit_on_switch poll doesn't read
@@ -3554,6 +3584,47 @@ void Overview::stepWorkspace(int dir, bool wrap) {
         switchToWorkspace(m_strip[real[next]]);
 }
 
+// Touchpad swipes (swipe_fingers, default 3) while the overview is up belong to it:
+// sideways steps the displayed workspace, one per swipe (fingers left = next, like
+// Hyprland's workspace swipe with its default workspace_swipe_invert), down closes it.
+// Without this, Hyprland's own workspace swipe gesture switches the live workspace
+// behind the overview. The swipe is claimed at begin, when its direction is not known
+// yet, so Hyprland's gestures never see half of one. Closed, swipes pass through.
+bool Overview::onSwipeBegin(const IPointer::SSwipeBeginEvent& e) {
+    m_swipeOwned = m_active && cfgInt("plugin:gloview:swipe_enabled", 1) != 0 &&
+        static_cast<int>(e.fingers) == cfgInt("plugin:gloview:swipe_fingers", 3);
+    if (!m_swipeOwned)
+        return false;
+    m_swipeX = m_swipeY = 0.0;
+    m_swipeStepped      = false;
+    return true;
+}
+
+bool Overview::onSwipeUpdate(const IPointer::SSwipeUpdateEvent& e) {
+    if (!m_swipeOwned)
+        return false;
+    m_swipeX += e.delta.x;
+    m_swipeY += e.delta.y;
+    // One workspace per swipe, however long (like macOS). Without swipe_wrap, a swipe
+    // past either end of the strip does nothing.
+    const double step = std::max(1, cfgInt("plugin:gloview:swipe_distance", 200));
+    if (m_active && !m_swipeStepped && std::abs(m_swipeX) >= step && std::abs(m_swipeX) > std::abs(m_swipeY)) {
+        stepWorkspace(m_swipeX < 0 ? 1 : -1, cfgInt("plugin:gloview:swipe_wrap", 0) != 0);
+        m_swipeStepped = true;
+    }
+    return true;
+}
+
+bool Overview::onSwipeEnd(const IPointer::SSwipeEndEvent& e) {
+    if (!m_swipeOwned)
+        return false;
+    m_swipeOwned        = false;
+    const int closeDist = cfgInt("plugin:gloview:swipe_close_distance", 150); // 0 = never
+    if (closeDist > 0 && m_active && !e.cancelled && !m_swipeStepped && m_swipeY >= closeDist && m_swipeY > std::abs(m_swipeX))
+        close();
+    return true;
+}
+
 // Fade out bars/popups so they don't bleed through the translucent backdrop: stash each
 // layer surface's alpha goal and drive it to 0; restoreLayers() animates them back. Fully
 // reversible (nothing persists past close); works for any layer-shell client.
@@ -3738,6 +3809,118 @@ void Overview::deactivate() {
 void Overview::damage() const {
     if (const auto m = m_monitor.lock(); m && g_pHyprRenderer)
         g_pHyprRenderer->damageMonitor(m);
+}
+
+
+// ---- multi-monitor group ----------------------------------------------------
+
+Overview* Overview::forMonitor(const PHLMONITOR& m) {
+    if (!m || g_overviews.empty())
+        return nullptr;
+    for (const auto& o : g_overviews)
+        if (o->m_monitor.lock() == m)
+            return o.get();
+    // An instance whose monitor went away (unplugged) can serve another one.
+    for (const auto& o : g_overviews)
+        if (!o->m_active && !o->m_monitor.lock())
+            return o.get();
+    // Hooks and listeners stay with the first instance; this one only holds state.
+    g_overviews.push_back(std::make_unique<Overview>(g_overviews.front()->m_handle));
+    return g_overviews.back().get();
+}
+
+Overview* Overview::pointerOwner() {
+    Overview*  first = nullptr;
+    const auto m     = State::monitorState()->query().vec(Pointer::mgr()->position()).run();
+    for (const auto& o : g_overviews) {
+        if (!o->m_active)
+            continue;
+        if (m && o->m_monitor.lock() == m)
+            return o.get();
+        if (!first)
+            first = o.get();
+    }
+    // Cursor over a monitor with no overview (all_monitors off): the open one gets the
+    // input, as with a single instance (a click there dismisses it).
+    return first;
+}
+
+Overview* Overview::commandTarget() {
+    if (const auto o = pointerOwner())
+        return o;
+    if (const auto o = forMonitor(State::monitorState()->query().vec(Pointer::mgr()->position()).run()))
+        return o;
+    return g_overview;
+}
+
+bool Overview::anyOpen() {
+    for (const auto& o : g_overviews)
+        if (o->m_active && o->m_opening)
+            return true;
+    return false;
+}
+
+void Overview::openGroup(int allOverride) {
+    if (anyOpen() || !g_overview)
+        return;
+    std::vector<PHLMONITOR> targets;
+    const auto              cursorMon = State::monitorState()->query().vec(Pointer::mgr()->position()).run();
+    if (g_overview->cfgInt("plugin:gloview:all_monitors", 0) != 0) {
+        for (const auto& m : State::monitorState()->monitors())
+            if (m && m->m_enabled)
+                targets.push_back(m);
+    } else if (cursorMon)
+        targets.push_back(cursorMon);
+    for (const auto& m : targets) {
+        const auto o = forMonitor(m);
+        if (!o)
+            continue;
+        o->m_allOverride = allOverride; // before open(): buildTiles reads it
+        o->open(m);
+        if (!o->m_active)
+            o->m_allOverride = -1; // declined (nothing to show) — don't leave it armed
+    }
+}
+
+void Overview::closeGroup() {
+    // close() on each instance calls back into here; only the outermost call walks them.
+    static bool closing = false;
+    if (closing)
+        return;
+    closing = true;
+    for (size_t i = 0; i < g_overviews.size(); ++i)
+        if (g_overviews[i]->m_active && g_overviews[i]->m_opening)
+            g_overviews[i]->closeSelf();
+    closing = false;
+}
+
+void Overview::toggleGroup() {
+    if (anyOpen())
+        closeGroup();
+    else
+        openGroup();
+}
+
+// gloview:allworkspaces on the group: opens every monitor straight into the expo view, or
+// flips the view on each open one.
+void Overview::toggleAllWorkspacesGroup() {
+    if (!anyOpen()) {
+        openGroup(1);
+        return;
+    }
+    for (size_t i = 0; i < g_overviews.size(); ++i)
+        if (g_overviews[i]->m_active && g_overviews[i]->m_opening)
+            g_overviews[i]->toggleAllWorkspaces();
+}
+
+void Overview::toggleDesktopGroup() {
+    for (size_t i = 0; i < g_overviews.size(); ++i)
+        g_overviews[i]->toggleDesktop(); // no-op on a closed instance
+}
+
+void Overview::hardCloseGroup() {
+    for (const auto& o : g_overviews)
+        o->hardClose();
 }
 
 } // namespace gloview
