@@ -188,6 +188,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     addInt("plugin:gloview:focus_follows_mouse", Config::INTEGER{1});      // keyboard selection tracks the hovered tile
     addInt("plugin:gloview:scroll_switches_workspace", Config::INTEGER{1});// wheel over the main area steps prev/next workspace
     addInt("plugin:gloview:passthrough_keys", Config::INTEGER{1});         // unhandled keys reach Hyprland (keybinds keep working)
+    addInt("plugin:gloview:swipe_enabled", Config::INTEGER{1});            // touchpad swipes while open step workspaces / close
+    addInt("plugin:gloview:swipe_fingers", Config::INTEGER{3});            // finger count of those swipes
+    addInt("plugin:gloview:swipe_distance", Config::INTEGER{200});         // sideways travel that steps one workspace
+    addInt("plugin:gloview:swipe_close_distance", Config::INTEGER{150});   // downward travel that closes (0 = off)
+    addInt("plugin:gloview:swipe_wrap", Config::INTEGER{0});               // swipes wrap around the strip ends
     addInt("plugin:gloview:exit_on_click", Config::INTEGER{1});           // click on empty space dismisses the overview
     addInt("plugin:gloview:debug_logs", Config::INTEGER{0});              // verbose [gloview] logging
     addInt("plugin:gloview:select_border_size", Config::INTEGER{3});      // keyboard-selected tile ring thickness (px)

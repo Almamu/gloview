@@ -545,6 +545,44 @@ bool Overview::initialize() {
         if (cancel)
             info.cancelled = true;
     });
+    // Touchpad swipes (swipe_fingers, default 3) while the overview is up belong to it:
+    // sideways steps the displayed workspace, one per swipe (fingers left = next, like
+    // Hyprland's workspace swipe with its default workspace_swipe_invert), down closes it.
+    // Without this, Hyprland's own workspace swipe gesture switches the live workspace
+    // behind the overview. The swipe is claimed at begin, when its direction is not known
+    // yet, so Hyprland's gestures never see half of one. Closed, swipes pass through.
+    m_swipeBeginL = events.gesture.swipe.begin.listen([this](const IPointer::SSwipeBeginEvent& e, Event::SCallbackInfo& info) {
+        m_swipeOwned = m_active && cfgInt("plugin:gloview:swipe_enabled", 1) != 0 &&
+            static_cast<int>(e.fingers) == cfgInt("plugin:gloview:swipe_fingers", 3);
+        if (!m_swipeOwned)
+            return;
+        m_swipeX = m_swipeY = 0.0;
+        m_swipeStepped      = false;
+        info.cancelled      = true;
+    });
+    m_swipeUpdateL = events.gesture.swipe.update.listen([this](const IPointer::SSwipeUpdateEvent& e, Event::SCallbackInfo& info) {
+        if (!m_swipeOwned)
+            return;
+        info.cancelled = true;
+        m_swipeX += e.delta.x;
+        m_swipeY += e.delta.y;
+        // One workspace per swipe, however long (like macOS). Without swipe_wrap, a swipe
+        // past either end of the strip does nothing.
+        const double step = std::max(1, cfgInt("plugin:gloview:swipe_distance", 200));
+        if (m_active && !m_swipeStepped && std::abs(m_swipeX) >= step && std::abs(m_swipeX) > std::abs(m_swipeY)) {
+            stepWorkspace(m_swipeX < 0 ? 1 : -1, cfgInt("plugin:gloview:swipe_wrap", 0) != 0);
+            m_swipeStepped = true;
+        }
+    });
+    m_swipeEndL = events.gesture.swipe.end.listen([this](const IPointer::SSwipeEndEvent& e, Event::SCallbackInfo& info) {
+        if (!m_swipeOwned)
+            return;
+        info.cancelled = true;
+        m_swipeOwned   = false;
+        const int closeDist = cfgInt("plugin:gloview:swipe_close_distance", 150); // 0 = never
+        if (closeDist > 0 && m_active && !e.cancelled && !m_swipeStepped && m_swipeY >= closeDist && m_swipeY > std::abs(m_swipeX))
+            close();
+    });
 
     const auto matches = HyprlandAPI::findFunctionsByName(m_handle, "shouldRenderWindow");
     void*      addr    = nullptr;
@@ -3478,7 +3516,7 @@ void Overview::syncTiles() {
 }
 
 // Scroll wheel over the main area: show the previous/next workspace card (wraps).
-void Overview::stepWorkspace(int dir) {
+void Overview::stepWorkspace(int dir, bool wrap) {
     if (m_strip.empty())
         return;
     // collect only the real workspace cards (skip the "+" and the optional "All" card),
@@ -3499,6 +3537,8 @@ void Overview::stepWorkspace(int dir) {
     if (activePos < 0)
         activePos = 0;
     int next = activePos + (dir > 0 ? 1 : -1);
+    if (!wrap && (next < 0 || next >= static_cast<int>(real.size())))
+        return; // at the end of the strip (swipes without swipe_wrap)
     if (next < 0)
         next = static_cast<int>(real.size()) - 1; // wrap to last
     else if (next >= static_cast<int>(real.size()))

@@ -265,6 +265,13 @@ class Overview {
     CHyprSignalListener m_mouseAxisL;
     CHyprSignalListener m_mouseMoveL;
     CHyprSignalListener m_keyL;
+    // touchpad swipe handling while open (see the swipe listeners in initialize())
+    CHyprSignalListener      m_swipeBeginL;
+    CHyprSignalListener      m_swipeUpdateL;
+    CHyprSignalListener      m_swipeEndL;
+    bool                     m_swipeOwned   = false; // this swipe began while open: ours to the end
+    bool                     m_swipeStepped = false; // it already switched a workspace (one per swipe)
+    double                   m_swipeX = 0.0, m_swipeY = 0.0;
     CFunctionHook*      m_shouldRenderHook = nullptr;
     CFunctionHook*      m_shouldRenderWindowHook = nullptr; // one-arg shouldRenderWindow, used by makeSnapshot()
 
@@ -348,7 +355,7 @@ class Overview {
     void   closeTileWindow(int i);            // send-close a tile's window, then reflow the rest
     void   replayReflow(std::vector<std::pair<PHLWINDOW, LRect>>& oldBoxes); // glide tiles into new slots after a removal
     void   syncTiles();                       // add/drop tiles when the displayed workspace's window set changes, then reflow
-    void   stepWorkspace(int dir);            // scroll-wheel over the main area: show prev/next workspace card
+    void   stepWorkspace(int dir, bool wrap = true); // scroll-wheel / swipe: show prev/next workspace card
     // gloview:next / gloview:prev with the overview CLOSED: walk the LIVE desktop through the
     // same ordered list the strip would show (dynamic_workspaces' empty tail included).
     std::vector<PHLWORKSPACE> liveWorkspaceList(const PHLMONITOR& m) const;
