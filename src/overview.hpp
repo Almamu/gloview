@@ -282,6 +282,12 @@ class Overview {
     double m_grabDX = 0, m_grabDY = 0;// cursor offset inside the tile at grab
     double m_dragX  = 0, m_dragY  = 0;// current monitor-local cursor
 
+    // drag-and-drop of a workspace card onto another monitor (all_monitors). The press sets
+    // m_pressTile = PRESS_STRIP and reuses m_pressX/Y, m_grabDX/DY and m_dragX/Y.
+    PHLWORKSPACEREF m_cardPressWs;          // workspace of the pressed card; a plain click switches to it on release
+    bool            m_cardDragging = false; // moved past the threshold
+    double          m_cardW = 0, m_cardH = 0; // the card's size at the press
+
     CHyprSignalListener m_renderStageL;
     CHyprSignalListener m_mouseButtonL;
     CHyprSignalListener m_mouseAxisL;
@@ -363,7 +369,13 @@ class Overview {
     // all_monitors: a preview dragged out of another monitor's overview
     const Overview* foreignDrag() const;                            // that overview, while its drag is over this monitor
     LRect           foreignDragBox(const Overview& src) const;      // its dragged tile, in this monitor's coords
-    bool            acceptForeignDrop(const PHLWINDOW& w, double lx, double ly); // dropped here: move the window onto this monitor
+    bool            acceptForeignDrop(const PHLWINDOW& w, double lx, double ly, const LRect& fromBox); // dropped here: move the window onto this monitor
+    const Overview* cardDragOver() const;                        // the overview (this one or another monitor's) whose dragged card is over this monitor
+    LRect           cardDragBox(const Overview& src) const;         // that dragged card's box, in this monitor's coords
+    void            drawDraggedCard(const Overview& src, const LRect& card) const; // its chrome (fill, window backings, ring)
+    void            queueDraggedCardWindows(const Overview& src, const LRect& card) const; // its live window previews
+    bool            acceptWorkspaceDrop(const PHLWORKSPACE& ws);    // a card dropped here: move that workspace onto this monitor
+    const StripItem* draggedCardItem() const;                      // the strip entry of our dragged card
     void   swapTiles(int a, int b);           // drag a preview onto another → swap the two windows' places (real layout + overview)
     void   addWorkspace(int id = 0);          // "+" / trailing empty card: create a workspace (animate it in, optionally follow); 0 = lowest free id
     void   closeWorkspaceWindows(const StripItem& it); // middle-click a card: send-close every window on it

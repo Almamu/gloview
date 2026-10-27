@@ -17,6 +17,7 @@
 #include <hyprland/src/desktop/state/GlobalWindowController.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/state/WorkspaceState.hpp>
+#include <hyprland/src/state/WorkspacePlacementController.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
@@ -959,6 +960,8 @@ void Overview::open(PHLMONITOR target) {
     m_pressTile = -1;
     m_dragging  = false;
     m_dragX = m_dragY = m_pressX = m_pressY = m_grabDX = m_grabDY = 0.0;
+    m_cardPressWs.reset();
+    m_cardDragging = false;
     m_canvasPos.clear();
     m_desktopMode = false; // open into the tidy grid; Shift / gloview:desktop flips to the canvas
     m_newCardAnim = false;
@@ -1914,7 +1917,7 @@ void Overview::renderStage(eRenderStage stage) {
         pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::FlyBack));
         renderFlyWindow();
     }
-    const bool dragging = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) || foreignDrag();
+    const bool dragging = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) || foreignDrag() || cardDragOver();
     if (dragging) {
         pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::DragBack));
         renderDragWindow();
@@ -2255,6 +2258,13 @@ void Overview::renderPreviewRings() const {
 }
 
 void Overview::renderDragRing() const {
+    if (const auto* card = cardDragOver()) { // a dragged workspace card: the lifted (hover) ring
+        const auto m = m_monitor.lock();
+        if (m)
+            renderRing(pxb(cardDragBox(*card), m->m_scale), argb(cfgColor("plugin:gloview:hover_border", 0xf0ffffff), eased()),
+                       cfgInt("plugin:gloview:strip_card_round", 10) * m->m_scale, std::max(1, cfgInt("plugin:gloview:hover_border_size", 3)));
+        return;
+    }
     const int dragIdx = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
     if (dragIdx < 0) {
         // another monitor's dragged preview crossing onto this one: the lifted (hover) ring
@@ -2284,6 +2294,88 @@ const Overview* Overview::foreignDrag() const {
             return o.get();
     }
     return nullptr;
+}
+
+const Overview* Overview::cardDragOver() const {
+    const auto m = m_monitor.lock();
+    if (!m_active || !m)
+        return nullptr;
+    for (const auto& o : g_overviews) {
+        if (!o->m_active || !o->m_cardDragging || o->m_cardPressWs.expired())
+            continue;
+        const LRect b = cardDragBox(*o);
+        if (b.x + b.w > 0 && b.y + b.h > 0 && b.x < m->m_size.x && b.y < m->m_size.y)
+            return o.get();
+    }
+    return nullptr;
+}
+
+LRect Overview::cardDragBox(const Overview& src) const {
+    const auto m  = m_monitor.lock();
+    const auto sm = src.m_monitor.lock();
+    if (!m || !sm)
+        return LRect{0, 0, 0, 0};
+    return LRect{src.m_dragX - src.m_grabDX + sm->m_position.x - m->m_position.x, src.m_dragY - src.m_grabDY + sm->m_position.y - m->m_position.y, src.m_cardW, src.m_cardH};
+}
+
+// the strip entry of the card being dragged (looked up by workspace: the strip rebuilds)
+const Overview::StripItem* Overview::draggedCardItem() const {
+    const auto target = m_cardPressWs.lock();
+    for (const auto& it : m_strip)
+        if (target && !it.isPlus && !it.isAll && it.ws.lock() == target)
+            return &it;
+    return nullptr;
+}
+
+void Overview::drawDraggedCard(const Overview& src, const LRect& card) const {
+    const auto  m  = m_monitor.lock();
+    const auto* it = src.draggedCardItem();
+    if (!m || !it)
+        return;
+    const double s     = m->m_scale;
+    const double e     = eased();
+    const int    round = cfgInt("plugin:gloview:strip_card_round", 10);
+    g_pHyprOpenGL->renderRoundedShadow(pxb(LRect{card.x, card.y + 10.0, card.w, card.h}, s), pxr(round, s), 2.F, static_cast<int>(24.0 * s),
+                                       argb(cfgColor("plugin:gloview:shadow_color", 0x70000000), 1.0), e * 0.9);
+    // the lifted card reads as the active one, and stays opaque over whatever it crosses
+    g_pHyprOpenGL->renderRect(pxb(card, s), argb(cfgColor("plugin:gloview:strip_active_color", 0x4d1c2c44), e), {.round = pxr(round, s)});
+    for (const auto& sw : it->wins) {
+        const auto w = sw.win.lock();
+        if (!w || !w->m_isMapped || w->isHidden())
+            continue;
+        // opaque backing per window slot, cropped to the card (see renderStrip)
+        const LRect wb{card.x + sw.rel.x * card.w + 1.0, card.y + sw.rel.y * card.h + 1.0, std::max(2.0, sw.rel.w * card.w - 2.0), std::max(2.0, sw.rel.h * card.h - 2.0)};
+        const LRect vis = intersectRect(wb, card);
+        if (vis.w <= 0.0 || vis.h <= 0.0)
+            continue;
+        const bool   cropped  = !roughly(vis.w, wb.w, 0.01) || !roughly(vis.h, wb.h, 0.01);
+        const double winRound = stripWindowRound(round, std::max(2.0, sw.rel.w * card.w), std::max(2.0, sw.rel.h * card.h), cropped);
+        g_pHyprOpenGL->renderRect(pxb(vis, s), argb(0xff14181f, e), {.round = pxr(winRound, s), .roundingPower = w->roundingPower()});
+    }
+}
+
+void Overview::queueDraggedCardWindows(const Overview& src, const LRect& card) const {
+    const auto  m  = m_monitor.lock();
+    const auto* it = src.draggedCardItem();
+    if (!m || !it)
+        return;
+    const double scale = m->m_scale;
+    const auto   when  = Time::steadyNow();
+    const CBox   cardPx(card.x * scale, card.y * scale, card.w * scale, card.h * scale);
+    for (const auto& sw : it->wins) {
+        const auto w = sw.win.lock();
+        if (!w || !w->m_isMapped || w->isHidden())
+            continue;
+        // same slot / crop / rounding as renderStripWindows
+        const LRect slot{card.x + sw.rel.x * card.w, card.y + sw.rel.y * card.h, std::max(2.0, sw.rel.w * card.w), std::max(2.0, sw.rel.h * card.h)};
+        const CBox  slotPx(slot.x * scale, slot.y * scale, slot.w * scale, slot.h * scale);
+        const CBox  clipPx = intersectBox(slotPx, cardPx);
+        if (clipPx.w <= 0.0 || clipPx.h <= 0.0)
+            continue;
+        const bool   cropped    = !roughly(clipPx.w, slotPx.w, 0.01) || !roughly(clipPx.h, slotPx.h, 0.01);
+        const double stripRound = stripWindowRound(cfgInt("plugin:gloview:strip_card_round", 10), slot.w, slot.h, cropped);
+        renderWindowLive(w, m, slotPx, clipPx, static_cast<float>(eased()), when, m_previewFilterGrid, stripRound);
+    }
 }
 
 LRect Overview::foreignDragBox(const Overview& src) const {
@@ -2463,6 +2555,10 @@ void Overview::renderFlyWindow() const {
 }
 
 void Overview::renderDragTile() const {
+    if (const auto* card = cardDragOver()) { // a dragged workspace card: its chrome
+        drawDraggedCard(*card, cardDragBox(*card));
+        return;
+    }
     const int dragIdx = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
     if (dragIdx < 0) {
         // another monitor's dragged preview: the lifted shadow + backing of drawPreviewTile
@@ -2483,6 +2579,10 @@ void Overview::renderDragTile() const {
 }
 
 void Overview::renderDragWindow() const {
+    if (const auto* card = cardDragOver()) { // a dragged workspace card: its live windows
+        queueDraggedCardWindows(*card, cardDragBox(*card));
+        return;
+    }
     const int   dragIdx = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
     const auto* src     = dragIdx < 0 ? foreignDrag() : this; // another monitor's drag crossing onto this one
     if (!src)
@@ -2647,6 +2747,21 @@ void Overview::updateHover() {
     const double lx = mc.x - m->m_position.x;
     const double ly = mc.y - m->m_position.y;
 
+    // same for a pressed workspace card (only armed with all_monitors, see onMouseButton)
+    if (!m_cardPressWs.expired()) {
+        const double dx = lx - m_pressX;
+        const double dy = ly - m_pressY;
+        if (!m_cardDragging && (dx * dx + dy * dy) > 64.0) // ~8px
+            m_cardDragging = true;
+        if (m_cardDragging) {
+            m_dragX   = lx;
+            m_dragY   = ly;
+            m_hovered = m_hoveredStrip = -1;
+            damage();
+            return;
+        }
+    }
+
     // drag tracking: promote a pressed tile to a real drag once the pointer passes a
     // small threshold, then follow the cursor.
     if (m_pressTile >= 0) {
@@ -2687,9 +2802,9 @@ void Overview::updateHover() {
         m_hoveredStrip = newStrip;
         // keep the keyboard selection under the pointer so arrow-nav picks up where
         // the mouse left off (macOS-like). Only when actually over a tile.
-        // Not while another monitor's preview is dragged over us: hovering a drop target
-        // must not steal keyboard focus.
-        if (newTile >= 0 && cfgInt("plugin:gloview:focus_follows_mouse", 1) != 0 && !foreignDrag()) {
+        // Not while a preview or card from another monitor is dragged over us: hovering a
+        // drop target must not steal keyboard focus.
+        if (newTile >= 0 && cfgInt("plugin:gloview:focus_follows_mouse", 1) != 0 && !foreignDrag() && !cardDragOver()) {
             m_selected = newTile;
             syncFocus(); // so a passthrough killactive/hotkey hits the hovered window
         }
@@ -2759,7 +2874,18 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
                     toggleAllWorkspacesGroup(); // every open monitor flips together
                 else if (m_strip[i].isPlus)
                     addWorkspace(m_strip[i].id); // 0 for the plain "+"; the advertised id for the dynamic tail
-                else
+                else if (!m_strip[i].ws.expired() && cfgInt("plugin:gloview:all_monitors", 0) != 0) {
+                    // a card can be dragged onto another monitor, so click vs drag is decided
+                    // on release (a click still switches to it)
+                    m_cardPressWs  = m_strip[i].ws;
+                    m_cardDragging = false;
+                    m_pressX = m_dragX = lx;
+                    m_pressY = m_dragY = ly;
+                    m_grabDX = lx - c.x;
+                    m_grabDY = ly - c.y;
+                    m_cardW  = c.w;
+                    m_cardH  = c.h;
+                } else
                     switchToWorkspace(m_strip[i]);
                 return true;
             }
@@ -2792,8 +2918,43 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
     const LRect draggedBox = (m_dragging && press >= 0 && press < static_cast<int>(m_tiles.size())) ? tileContentBox(static_cast<size_t>(press), dragBox()) : LRect{};
     m_pressTile            = PRESS_NONE;
 
-    if (press == PRESS_STRIP || press == PRESS_CONSUMED)
-        return true; // switch / ✕ already handled on press; ignore the release
+    if (press == PRESS_STRIP) {
+        const auto ws      = m_cardPressWs.lock();
+        const bool dragged = m_cardDragging;
+        m_cardPressWs.reset();
+        m_cardDragging = false;
+        if (!ws)
+            return true; // All / "+" were handled on press
+        if (!dragged) {
+            StripItem it;
+            it.ws = ws;
+            switchToWorkspace(it);
+            return true;
+        }
+        // released over another monitor's overview → move the workspace there. Anywhere
+        // on this monitor the card just snaps back (cards are ordered by workspace id).
+        if (!(lx >= 0 && ly >= 0 && lx < m->m_size.x && ly < m->m_size.y)) {
+            const auto cm = State::monitorState()->query().vec(mc).run();
+            for (const auto& o : g_overviews) {
+                if (o.get() == this || !o->m_active || !cm || o->m_monitor.lock() != cm)
+                    continue;
+                if (o->acceptWorkspaceDrop(ws)) {
+                    // If we were showing it, show what Hyprland made live here instead, so
+                    // commitWorkspace() doesn't pull a workspace of another monitor back.
+                    if (m_workspace.lock() == ws || !m_workspace.lock())
+                        m_workspace = m->m_activeWorkspace;
+                    m_liveWsAtOpen = m->m_activeWorkspace;
+                    std::vector<std::pair<PHLWINDOW, LRect>> none;
+                    replayReflow(none);
+                }
+                break;
+            }
+        }
+        damage();
+        return true;
+    }
+    if (press == PRESS_CONSUMED)
+        return true; // ✕ already handled on press; ignore the release
 
     if (press >= 0 && press < static_cast<int>(m_tiles.size())) {
         const auto w = m_tiles[press].win.lock();
@@ -2821,7 +2982,9 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
                     if (win && win != w)
                         oldBoxes.emplace_back(win, currentBox(m_tiles[i], static_cast<int>(i)));
                 }
-                if (dst && dst->acceptForeignDrop(w, mc.x - cm->m_position.x, mc.y - cm->m_position.y))
+                const Vector2D toDst = dst ? m->m_position - cm->m_position : Vector2D{};
+                const LRect    from{draggedBox.x + toDst.x, draggedBox.y + toDst.y, draggedBox.w, draggedBox.h};
+                if (dst && dst->acceptForeignDrop(w, mc.x - cm->m_position.x, mc.y - cm->m_position.y, from))
                     replayReflow(oldBoxes);
                 damage(); // no overview there or nothing to move → the tile snaps back
                 return true;
@@ -2925,8 +3088,9 @@ void Overview::dropOnWorkspace(const PHLWINDOW& w, const StripItem& it, const LR
 // A preview dragged out of another monitor's overview was released over this one (lx/ly in
 // this monitor's coords). Onto a workspace card → that workspace ("+" creates one here);
 // onto a preview → that window's workspace (they differ in the all-workspaces view); anywhere
-// else → the workspace shown in the main area. syncTiles() picks the window up next frame.
-bool Overview::acceptForeignDrop(const PHLWINDOW& w, double lx, double ly) {
+// else → the workspace shown in the main area. fromBox (this monitor's coords) is where the
+// preview was let go, so a window landing in the main area glides from there into its slot.
+bool Overview::acceptForeignDrop(const PHLWINDOW& w, double lx, double ly, const LRect& fromBox) {
     const auto m = m_monitor.lock();
     if (!m_active || !w || !m)
         return false;
@@ -2964,8 +3128,49 @@ bool Overview::acceptForeignDrop(const PHLWINDOW& w, double lx, double ly) {
     if (!target || target->m_isSpecialWorkspace || target == w->m_workspace || target->m_monitor.lock() != m)
         return false;
 
+    std::vector<std::pair<PHLWINDOW, LRect>> oldBoxes{{w, fromBox}};
+    for (size_t i = 0; i < m_tiles.size(); ++i)
+        if (const auto win = m_tiles[i].win.lock())
+            oldBoxes.emplace_back(win, currentBox(m_tiles[i], static_cast<int>(i)));
+
     Desktop::globalWindowController()->moveWindowToWorkspace(w, target);
-    damage();
+
+    // Rebuild tiles AND the strip: syncTiles() would add the window to the main area, but
+    // only buildStrip() shows a workspace the drop just created on a "+" card.
+    replayReflow(oldBoxes);
+    return true;
+}
+
+// A workspace card dragged out of another monitor's overview was released over this one:
+// move that workspace (and its windows) here and show it in the main area.
+bool Overview::acceptWorkspaceDrop(const PHLWORKSPACE& ws) {
+    const auto m = m_monitor.lock();
+    if (!m_active || !m || !ws || ws->m_isSpecialWorkspace || ws->m_monitor.lock() == m)
+        return false;
+
+    const auto from = ws->m_monitor.lock();
+    State::workspacePlacementController()->moveWorkspaceToMonitor(ws, m, true);
+    if (ws->m_monitor.lock() != m)
+        return false;
+
+    // Moving a live workspace starts Hyprland's own workspace slides on both monitors; the
+    // overview draws from those offsets, so settle them now (warp, as commitWorkspace does).
+    for (const auto& w : State::workspaceState()->workspaces()) {
+        const auto wm = w->m_monitor.lock();
+        if (!wm || (wm != m && wm != from))
+            continue;
+        if (w->m_renderOffset)
+            w->m_renderOffset->setValueAndWarp(w->m_renderOffset->goal());
+        if (w->m_alpha)
+            w->m_alpha->setValueAndWarp(w->m_alpha->goal());
+    }
+
+    // Hyprland may have made it live here already; either way the overview shows it and
+    // commitWorkspace() makes it live on close. Accept the live change for exit_on_switch.
+    m_workspace    = ws;
+    m_liveWsAtOpen = m->m_activeWorkspace;
+    std::vector<std::pair<PHLWINDOW, LRect>> none;
+    replayReflow(none);
     return true;
 }
 
