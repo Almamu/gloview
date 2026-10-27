@@ -360,6 +360,10 @@ class Overview {
     void   switchToWorkspace(const StripItem& it);
     void   commitWorkspace();                 // push the displayed workspace to the live desktop, warping Hyprland's own slide away
     void   dropOnWorkspace(const PHLWINDOW& w, const StripItem& it, const LRect& fromBox);
+    // all_monitors: a preview dragged out of another monitor's overview
+    const Overview* foreignDrag() const;                            // that overview, while its drag is over this monitor
+    LRect           foreignDragBox(const Overview& src) const;      // its dragged tile, in this monitor's coords
+    bool            acceptForeignDrop(const PHLWINDOW& w, double lx, double ly); // dropped here: move the window onto this monitor
     void   swapTiles(int a, int b);           // drag a preview onto another → swap the two windows' places (real layout + overview)
     void   addWorkspace(int id = 0);          // "+" / trailing empty card: create a workspace (animate it in, optionally follow); 0 = lowest free id
     void   closeWorkspaceWindows(const StripItem& it); // middle-click a card: send-close every window on it

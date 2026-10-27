@@ -1914,7 +1914,7 @@ void Overview::renderStage(eRenderStage stage) {
         pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::FlyBack));
         renderFlyWindow();
     }
-    const bool dragging = m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size());
+    const bool dragging = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) || foreignDrag();
     if (dragging) {
         pass.add(makeUnique<COverlayPass>(this, COverlayPass::Phase::DragBack));
         renderDragWindow();
@@ -2256,9 +2256,43 @@ void Overview::renderPreviewRings() const {
 
 void Overview::renderDragRing() const {
     const int dragIdx = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
-    if (dragIdx < 0)
+    if (dragIdx < 0) {
+        // another monitor's dragged preview crossing onto this one: the lifted (hover) ring
+        const auto  m   = m_monitor.lock();
+        const auto* src = foreignDrag();
+        if (!m || !src)
+            return;
+        const double s  = m->m_scale;
+        const double th = std::max(1, cfgInt("plugin:gloview:hover_border_size", 3));
+        renderRing(pxb(foreignDragBox(*src), s), argb(cfgColor("plugin:gloview:hover_border", 0xf0ffffff), eased()), cfgInt("plugin:gloview:preview_round", 12) * s, th);
         return;
+    }
     drawPreviewRing(static_cast<size_t>(dragIdx), dragBox(), true);
+}
+
+const Overview* Overview::foreignDrag() const {
+    const auto m = m_monitor.lock();
+    if (!m_active || !m)
+        return nullptr;
+    for (const auto& o : g_overviews) {
+        if (o.get() == this || !o->m_active || !o->m_dragging || o->m_pressTile < 0 || o->m_pressTile >= static_cast<int>(o->m_tiles.size()))
+            continue;
+        // each monitor draws only its own output, so the source draws the part of the
+        // preview still over its monitor and we draw the part that has crossed onto ours
+        const LRect b = foreignDragBox(*o);
+        if (b.x + b.w > 0 && b.y + b.h > 0 && b.x < m->m_size.x && b.y < m->m_size.y)
+            return o.get();
+    }
+    return nullptr;
+}
+
+LRect Overview::foreignDragBox(const Overview& src) const {
+    const auto m  = m_monitor.lock();
+    const auto sm = src.m_monitor.lock();
+    if (!m || !sm)
+        return LRect{0, 0, 0, 0};
+    const LRect b = src.tileContentBox(static_cast<size_t>(src.m_pressTile), src.dragBox());
+    return LRect{b.x + sm->m_position.x - m->m_position.x, b.y + sm->m_position.y - m->m_position.y, b.w, b.h};
 }
 
 // Fit `slot` to the window's real aspect so the live surface fills it exactly (uniform scale).
@@ -2430,24 +2464,38 @@ void Overview::renderFlyWindow() const {
 
 void Overview::renderDragTile() const {
     const int dragIdx = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
-    if (dragIdx < 0)
+    if (dragIdx < 0) {
+        // another monitor's dragged preview: the lifted shadow + backing of drawPreviewTile
+        const auto  m   = m_monitor.lock();
+        const auto* src = foreignDrag();
+        if (!m || !src)
+            return;
+        const double s     = m->m_scale;
+        const int    round = cfgInt("plugin:gloview:preview_round", 12);
+        const LRect  lb    = foreignDragBox(*src);
+        g_pHyprOpenGL->renderRoundedShadow(pxb(LRect{lb.x, lb.y + 14.0, lb.w, lb.h}, s), pxr(round, s), 2.F, static_cast<int>(30.0 * s),
+                                           argb(cfgColor("plugin:gloview:shadow_color", 0x70000000), 1.0), eased() * 0.9);
+        const LRect bb{lb.x + 1.0, lb.y + 1.0, std::max(0.0, lb.w - 2.0), std::max(0.0, lb.h - 2.0)};
+        g_pHyprOpenGL->renderRect(pxb(bb, s), argb(cfgColor("plugin:gloview:preview_bg", 0xff14181f), 1.0), {.round = pxr(round, s)});
         return;
+    }
     drawPreviewTile(static_cast<size_t>(dragIdx), dragBox(), true); // chrome; surface queued in renderDragWindow
 }
 
 void Overview::renderDragWindow() const {
-    const int dragIdx = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
-    if (dragIdx < 0)
+    const int   dragIdx = (m_dragging && m_pressTile >= 0 && m_pressTile < static_cast<int>(m_tiles.size())) ? m_pressTile : -1;
+    const auto* src     = dragIdx < 0 ? foreignDrag() : this; // another monitor's drag crossing onto this one
+    if (!src)
         return;
     const auto m = m_monitor.lock();
     if (!m)
         return;
-    const auto w = m_tiles[dragIdx].win.lock();
+    const auto w = src->m_tiles[src->m_pressTile].win.lock();
     if (!w || !w->m_isMapped || w->isHidden())
         return;
     const double e     = eased();
     const double scale = m->m_scale;
-    const LRect  lb    = tileContentBox(static_cast<size_t>(dragIdx), dragBox());
+    const LRect  lb    = src == this ? tileContentBox(static_cast<size_t>(dragIdx), dragBox()) : foreignDragBox(*src);
     const CBox   px(lb.x * scale, lb.y * scale, lb.w * scale, lb.h * scale);
     renderWindowLive(w, m, px, px, static_cast<float>(e), Time::steadyNow(), m_previewFilterGrid,
                      static_cast<double>(cfgInt("plugin:gloview:preview_round", 12)));
@@ -2639,7 +2687,9 @@ void Overview::updateHover() {
         m_hoveredStrip = newStrip;
         // keep the keyboard selection under the pointer so arrow-nav picks up where
         // the mouse left off (macOS-like). Only when actually over a tile.
-        if (newTile >= 0 && cfgInt("plugin:gloview:focus_follows_mouse", 1) != 0) {
+        // Not while another monitor's preview is dragged over us: hovering a drop target
+        // must not steal keyboard focus.
+        if (newTile >= 0 && cfgInt("plugin:gloview:focus_follows_mouse", 1) != 0 && !foreignDrag()) {
             m_selected = newTile;
             syncFocus(); // so a passthrough killactive/hotkey hits the hovered window
         }
@@ -2757,6 +2807,25 @@ bool Overview::onMouseButton(const IPointer::SButtonEvent& e) {
                     return true;
                 }
             }
+            // all_monitors: released over another monitor → hand the drop to its overview,
+            // which moves the window onto that monitor; the rest of ours reflows.
+            if (w && !(lx >= 0 && ly >= 0 && lx < m->m_size.x && ly < m->m_size.y)) {
+                const auto cm  = State::monitorState()->query().vec(mc).run();
+                Overview*  dst = nullptr;
+                for (const auto& o : g_overviews)
+                    if (o.get() != this && o->m_active && cm && o->m_monitor.lock() == cm)
+                        dst = o.get();
+                std::vector<std::pair<PHLWINDOW, LRect>> oldBoxes;
+                for (size_t i = 0; i < m_tiles.size(); ++i) {
+                    const auto win = m_tiles[i].win.lock();
+                    if (win && win != w)
+                        oldBoxes.emplace_back(win, currentBox(m_tiles[i], static_cast<int>(i)));
+                }
+                if (dst && dst->acceptForeignDrop(w, mc.x - cm->m_position.x, mc.y - cm->m_position.y))
+                    replayReflow(oldBoxes);
+                damage(); // no overview there or nothing to move → the tile snaps back
+                return true;
+            }
             // grid mode: dropped onto another preview → swap the two windows' places.
             // (Skipped in desktop/canvas mode, where a drop parks the preview instead.)
             if (!m_desktopMode && w && cfgInt("plugin:gloview:drag_to_swap", 1) != 0) {
@@ -2851,6 +2920,53 @@ void Overview::dropOnWorkspace(const PHLWINDOW& w, const StripItem& it, const LR
     // no backdrop flash / strip re-slide); tiles render live, nothing to recapture.
     replayReflow(oldBoxes);
     damage();
+}
+
+// A preview dragged out of another monitor's overview was released over this one (lx/ly in
+// this monitor's coords). Onto a workspace card → that workspace ("+" creates one here);
+// onto a preview → that window's workspace (they differ in the all-workspaces view); anywhere
+// else → the workspace shown in the main area. syncTiles() picks the window up next frame.
+bool Overview::acceptForeignDrop(const PHLWINDOW& w, double lx, double ly) {
+    const auto m = m_monitor.lock();
+    if (!m_active || !w || !m)
+        return false;
+
+    PHLWORKSPACE target;
+    bool         onCard = false;
+    for (size_t i = 0; i < m_strip.size() && !onCard; ++i) {
+        const LRect c = stripCardAt(i);
+        if (!(lx >= c.x && ly >= c.y && lx <= c.x + c.w && ly <= c.y + c.h))
+            continue;
+        onCard        = true;
+        const auto& it = m_strip[i];
+        if (it.isAll)
+            return false; // the "All" toggle is not a workspace
+        if (it.isPlus) {
+            const int id   = resolveNewId(it.id);
+            target         = State::workspaceState()->create(id, m->m_id);
+            m_newCardId    = id; // pop the new card in, as dropOnWorkspace does
+            m_newCardStart = std::chrono::steady_clock::now();
+            m_newCardAnim  = true;
+        } else
+            target = it.ws.lock();
+    }
+    if (!onCard) {
+        for (size_t i = 0; i < m_tiles.size() && !target; ++i) {
+            const LRect b = currentBox(m_tiles[i], static_cast<int>(i));
+            if (lx >= b.x && ly >= b.y && lx <= b.x + b.w && ly <= b.y + b.h)
+                if (const auto tw = m_tiles[i].win.lock())
+                    target = tw->m_workspace;
+        }
+        if (!target)
+            target = m_workspace.lock();
+    }
+
+    if (!target || target->m_isSpecialWorkspace || target == w->m_workspace || target->m_monitor.lock() != m)
+        return false;
+
+    Desktop::globalWindowController()->moveWindowToWorkspace(w, target);
+    damage();
+    return true;
 }
 
 // Swap two previews' windows in the real Hyprland layout AND the overview. Mirrors
